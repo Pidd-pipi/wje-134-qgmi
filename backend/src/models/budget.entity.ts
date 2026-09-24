@@ -2,6 +2,7 @@ import {
   Column,
   CreateDateColumn,
   Entity,
+  Index,
   OneToMany,
   PrimaryGeneratedColumn,
   UpdateDateColumn
@@ -10,6 +11,10 @@ import { CostItem } from './costItem.entity';
 import { BudgetStatus, Currency } from '../types/enums';
 
 @Entity({ name: 'project_budgets' })
+@Index('uq_project_budgets_approved_per_project', ['projectId'], {
+  unique: true,
+  where: `status = '${BudgetStatus.Approved}'`
+})
 export class ProjectBudget {
   @PrimaryGeneratedColumn('uuid')
   id: string;

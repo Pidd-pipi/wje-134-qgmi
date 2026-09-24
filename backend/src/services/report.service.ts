@@ -4,7 +4,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { CostReport } from '../models/costReport.entity';
 import { ProjectBudget } from '../models/budget.entity';
-import { AuditAction, ReportPeriod, ReportType } from '../types/enums';
+import { AuditAction, BudgetStatus, ReportPeriod, ReportType } from '../types/enums';
 import { RequestContext } from '../types/interfaces';
 import { AuditLogService } from './auditLog.service';
 import { AnalyticsService } from './analytics.service';
@@ -43,12 +43,12 @@ export class ReportService {
       return cached;
     }
 
-    const budgets = await this.budgetRepository.find({
-      where: { projectId: input.projectId },
+    const approvedBudget = await this.budgetRepository.findOne({
+      where: { projectId: input.projectId, status: BudgetStatus.Approved },
       relations: ['costItems']
     });
-    const costItems = budgets.flatMap((budget) => budget.costItems);
-    const approvedBudgetTotal = budgets.reduce((sum, budget) => sum + Number(budget.totalAmount), 0);
+    const costItems = approvedBudget?.costItems ?? [];
+    const approvedBudgetTotal = approvedBudget ? Number(approvedBudget.totalAmount) : 0;
     const summary = this.analyticsService.summarize(costItems, approvedBudgetTotal);
 
     const report = this.reportRepository.create({

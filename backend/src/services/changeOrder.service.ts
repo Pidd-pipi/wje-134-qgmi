@@ -1,11 +1,13 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { ChangeOrder } from '../models/changeOrder.entity';
 import { AuditAction, ChangeOrderStatus, ChangeType } from '../types/enums';
 import { AuthenticatedUser, RequestContext } from '../types/interfaces';
 import { calculateChangedAmount, toMoney } from '../utils/calculator';
 import { AuditLogService } from './auditLog.service';
+import { BudgetService } from './budget.service';
+import { RedisService } from './redis.service';
 
 export interface CreateChangeOrderInput {
   projectId: string;
@@ -21,7 +23,11 @@ export class ChangeOrderService {
   constructor(
     @InjectRepository(ChangeOrder)
     private readonly changeOrderRepository: Repository<ChangeOrder>,
-    private readonly auditLogService: AuditLogService
+    @InjectDataSource()
+    private readonly dataSource: DataSource,
+    private readonly budgetService: BudgetService,
+    private readonly auditLogService: AuditLogService,
+    private readonly redisService: RedisService
   ) {}
 
   async list(projectId?: string): Promise<ChangeOrder[]> {
@@ -72,19 +78,43 @@ export class ChangeOrderService {
   }
 
   async review(id: string, approved: boolean, reviewer: AuthenticatedUser, context: RequestContext): Promise<ChangeOrder> {
-    const changeOrder = await this.getById(id);
-    if (changeOrder.status !== ChangeOrderStatus.Submitted) {
-      throw new BadRequestException('只有已提交变更单可以审批');
-    }
+    let adjustmentMetadata: Record<string, unknown> = {};
 
-    changeOrder.status = approved ? ChangeOrderStatus.Approved : ChangeOrderStatus.Rejected;
-    changeOrder.approverId = reviewer.id;
-    changeOrder.approvedAt = new Date();
+    const saved = await this.dataSource.transaction(async (manager) => {
+      const changeOrder = await manager.getRepository(ChangeOrder).findOne({
+        where: { id },
+        lock: { mode: 'pessimistic_write' }
+      });
+      if (!changeOrder) {
+        throw new NotFoundException('变更单不存在');
+      }
+      if (changeOrder.status !== ChangeOrderStatus.Submitted) {
+        throw new BadRequestException('只有已提交变更单可以审批');
+      }
 
-    const saved = await this.changeOrderRepository.save(changeOrder);
-    await this.writeAudit(approved ? AuditAction.ChangeOrderApproved : AuditAction.ChangeOrderRejected, saved, context, {
-      approverId: reviewer.id
+      if (approved) {
+        const adjustment = await this.budgetService.applyChangeOrderAdjustment(manager, changeOrder);
+        adjustmentMetadata = {
+          budgetId: adjustment.budget.id,
+          previousTotalAmount: adjustment.previousTotalAmount,
+          adjustedTotalAmount: adjustment.adjustedTotalAmount
+        };
+      }
+
+      changeOrder.status = approved ? ChangeOrderStatus.Approved : ChangeOrderStatus.Rejected;
+      changeOrder.approverId = reviewer.id;
+      changeOrder.approvedAt = new Date();
+
+      return manager.getRepository(ChangeOrder).save(changeOrder);
     });
+
+    await this.writeAudit(approved ? AuditAction.ChangeOrderApproved : AuditAction.ChangeOrderRejected, saved, context, {
+      approverId: reviewer.id,
+      ...adjustmentMetadata
+    });
+    if (approved) {
+      await this.redisService.deleteByPattern(`reports:${saved.projectId}:*`);
+    }
     return saved;
   }
 
