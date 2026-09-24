@@ -2,6 +2,7 @@ import {
   Column,
   CreateDateColumn,
   Entity,
+  Index,
   OneToMany,
   PrimaryGeneratedColumn,
   UpdateDateColumn
@@ -9,7 +10,12 @@ import {
 import { CostItem } from './costItem.entity';
 import { BudgetStatus, Currency } from '../types/enums';
 
+// 同一项目最多只能有一份审批通过（生效）的预算
 @Entity({ name: 'project_budgets' })
+@Index('uq_project_budgets_effective', ['projectId'], {
+  unique: true,
+  where: `status = '${BudgetStatus.Approved}'`
+})
 export class ProjectBudget {
   @PrimaryGeneratedColumn('uuid')
   id: string;

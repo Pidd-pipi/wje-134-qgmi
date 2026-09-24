@@ -39,6 +39,30 @@ export class RedisService implements OnModuleDestroy {
     await this.client.set(key, JSON.stringify(value), 'EX', ttlSeconds);
   }
 
+  /** 按模式批量删除 key（使用 SCAN 游标，生产安全） */
+  async deleteByPattern(pattern: string): Promise<number> {
+    await this.ensureConnected();
+    const stream = this.client.scanStream({ match: pattern, count: 100 });
+    let deleted = 0;
+
+    await new Promise<void>((resolve, reject) => {
+      stream.on('data', (keys: string[]) => {
+        if (keys.length > 0) {
+          this.client
+            .unlink(keys)
+            .then((count) => {
+              deleted += count;
+            })
+            .catch(reject);
+        }
+      });
+      stream.on('end', () => resolve());
+      stream.on('error', reject);
+    });
+
+    return deleted;
+  }
+
   async onModuleDestroy(): Promise<void> {
     await this.client.quit();
   }

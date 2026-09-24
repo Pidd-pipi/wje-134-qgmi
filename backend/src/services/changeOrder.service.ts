@@ -1,11 +1,13 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { ChangeOrder } from '../models/changeOrder.entity';
 import { AuditAction, ChangeOrderStatus, ChangeType } from '../types/enums';
 import { AuthenticatedUser, RequestContext } from '../types/interfaces';
 import { calculateChangedAmount, toMoney } from '../utils/calculator';
 import { AuditLogService } from './auditLog.service';
+import { BudgetService } from './budget.service';
+import { ReportService } from './report.service';
 
 export interface CreateChangeOrderInput {
   projectId: string;
@@ -21,7 +23,10 @@ export class ChangeOrderService {
   constructor(
     @InjectRepository(ChangeOrder)
     private readonly changeOrderRepository: Repository<ChangeOrder>,
-    private readonly auditLogService: AuditLogService
+    private readonly budgetService: BudgetService,
+    private readonly reportService: ReportService,
+    private readonly auditLogService: AuditLogService,
+    private readonly dataSource: DataSource
   ) {}
 
   async list(projectId?: string): Promise<ChangeOrder[]> {
@@ -77,14 +82,66 @@ export class ChangeOrderService {
       throw new BadRequestException('只有已提交变更单可以审批');
     }
 
-    changeOrder.status = approved ? ChangeOrderStatus.Approved : ChangeOrderStatus.Rejected;
-    changeOrder.approverId = reviewer.id;
-    changeOrder.approvedAt = new Date();
+    let appliedChange:
+      | { previousTotalAmount: string; adjustedTotalAmount: string; adjustmentAmount: string; incurredCostAmount: string }
+      | undefined;
 
-    const saved = await this.changeOrderRepository.save(changeOrder);
-    await this.writeAudit(approved ? AuditAction.ChangeOrderApproved : AuditAction.ChangeOrderRejected, saved, context, {
-      approverId: reviewer.id
+    if (!approved) {
+      changeOrder.status = ChangeOrderStatus.Rejected;
+      changeOrder.approverId = reviewer.id;
+      changeOrder.approvedAt = new Date();
+      const saved = await this.changeOrderRepository.save(changeOrder);
+      await this.writeAudit(AuditAction.ChangeOrderRejected, saved, context, { approverId: reviewer.id });
+      return saved;
+    }
+
+    const saved = await this.dataSource.transaction(async (manager) => {
+      const lockedChangeOrder = await manager.findOne(ChangeOrder, {
+        where: { id },
+        lock: { mode: 'pessimistic_write' }
+      });
+
+      if (!lockedChangeOrder) {
+        throw new NotFoundException('变更单不存在');
+      }
+
+      if (lockedChangeOrder.status !== ChangeOrderStatus.Submitted) {
+        throw new BadRequestException('只有已提交变更单可以审批');
+      }
+
+      // 审批通过：把变更金额增减并入项目唯一生效预算，校验不通过则整笔回滚
+      const result = await this.budgetService.applyApprovedChangeOrder(
+        lockedChangeOrder.projectId,
+        lockedChangeOrder.id,
+        lockedChangeOrder.changeAmount,
+        manager
+      );
+
+      lockedChangeOrder.status = ChangeOrderStatus.Approved;
+      lockedChangeOrder.approverId = reviewer.id;
+      lockedChangeOrder.approvedAt = new Date();
+
+      appliedChange = {
+        previousTotalAmount: result.previousTotalAmount,
+        adjustedTotalAmount: result.adjustedTotalAmount,
+        adjustmentAmount: result.adjustmentAmount,
+        incurredCostAmount: result.incurredCostAmount
+      };
+
+      return manager.save(lockedChangeOrder);
     });
+
+    await this.writeAudit(AuditAction.ChangeOrderApproved, saved, context, {
+      approverId: reviewer.id,
+      previousBudgetTotal: appliedChange?.previousTotalAmount,
+      adjustmentAmount: appliedChange?.adjustmentAmount,
+      adjustedBudgetTotal: appliedChange?.adjustedTotalAmount,
+      incurredCostAmount: appliedChange?.incurredCostAmount
+    });
+
+    // 生效预算总额已调整，成本报告必须按新数展示
+    await this.reportService.invalidateProjectCache(saved.projectId);
+
     return saved;
   }
 
